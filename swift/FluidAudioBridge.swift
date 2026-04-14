@@ -19,9 +19,24 @@ class FluidAudioBridgeInternal {
     private var asrModels: AsrModels?
     private var vadManager: VadManager?
     private var diarizerManager: OfflineDiarizerManager?
-    private var streamingAsrManager: StreamingAsrManager?
-    private var qwen3AsrManager: Qwen3AsrManager?
-    private var qwen3StreamingManager: Qwen3StreamingManager?
+    private var streamingAsrManager: StreamingNemotronAsrManager?
+    // Qwen3 types are macOS 15+ — store as AnyObject to avoid availability errors
+    private var _qwen3AsrManager: AnyObject? = nil
+    private var _qwen3StreamingManager: AnyObject? = nil
+    // Japanese TDT ASR (AsrModels .tdtJa via AsrManager)
+    private var japaneseAsrManager: AsrManager?
+
+    @available(macOS 15, iOS 18, *)
+    private var qwen3AsrManager: Qwen3AsrManager? {
+        get { _qwen3AsrManager as? Qwen3AsrManager }
+        set { _qwen3AsrManager = newValue }
+    }
+
+    @available(macOS 15, iOS 18, *)
+    private var qwen3StreamingManager: Qwen3StreamingManager? {
+        get { _qwen3StreamingManager as? Qwen3StreamingManager }
+        set { _qwen3StreamingManager = newValue }
+    }
 
     init() {}
 
@@ -33,10 +48,7 @@ class FluidAudioBridgeInternal {
             do {
                 let models = try await AsrModels.downloadAndLoad()
                 self.asrModels = models
-
-                let manager = AsrManager()
-                try await manager.initialize(models: models)
-                self.asrManager = manager
+                self.asrManager = AsrManager(models: models)
             } catch {
                 initError = error
             }
@@ -62,7 +74,8 @@ class FluidAudioBridgeInternal {
         Task {
             do {
                 let url = URL(fileURLWithPath: path)
-                result = try await manager.transcribe(url)
+                var state = TdtDecoderState.make()
+                result = try await manager.transcribe(url, decoderState: &state)
             } catch {
                 transcribeError = error
             }
@@ -79,7 +92,7 @@ class FluidAudioBridgeInternal {
             throw BridgeError.noResult
         }
 
-        return (r.text, r.confidence, r.duration, r.processingTime, r.rtfx)
+        return (r.text, 0.0, 0.0, 0.0, 0.0)
     }
 
     func transcribeSamples(_ samples: [Float]) throws -> (String, Float, Double, Double, Float) {
@@ -93,7 +106,8 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
-                result = try await manager.transcribe(samples)
+                var state = TdtDecoderState.make()
+                result = try await manager.transcribe(samples, decoderState: &state)
             } catch {
                 transcribeError = error
             }
@@ -110,7 +124,8 @@ class FluidAudioBridgeInternal {
             throw BridgeError.noResult
         }
 
-        return (r.text, r.confidence, r.duration, r.processingTime, r.rtfx)
+        let duration = Double(samples.count) / 16000.0
+        return (r.text, 0.0, duration, 0.0, 0.0)
     }
 
     func isAsrAvailable() -> Bool {
@@ -220,10 +235,8 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
-                let models = try await AsrModels.downloadAndLoad()
-                self.asrModels = models
-
-                let manager = StreamingAsrManager()
+                let manager = StreamingNemotronAsrManager()
+                try await manager.loadModels()
                 self.streamingAsrManager = manager
             } catch {
                 initError = error
@@ -239,27 +252,11 @@ class FluidAudioBridgeInternal {
     }
 
     func streamingAsrStart() throws {
-        guard let manager = streamingAsrManager, let models = asrModels else {
+        guard streamingAsrManager != nil else {
             throw BridgeError.notInitialized
         }
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var startError: Error?
-
-        Task {
-            do {
-                try await manager.start(models: models, source: .microphone)
-            } catch {
-                startError = error
-            }
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-
-        if let error = startError {
-            throw error
-        }
+        // No-op: models are loaded (and state is reset) during initializeStreamingAsr().
+        // eridanus calls initializeStreamingAsr() before each utterance to clear state.
     }
 
     func streamingAsrFeed(_ samples: [Float]) throws {
@@ -267,24 +264,38 @@ class FluidAudioBridgeInternal {
             throw BridgeError.notInitialized
         }
 
+        let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16000,
+            channels: 1,
+            interleaved: false
+        )!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: UInt32(samples.count))!
+        buffer.frameLength = UInt32(samples.count)
+
+        if let channelData = buffer.floatChannelData {
+            for (i, sample) in samples.enumerated() {
+                channelData[0][i] = sample
+            }
+        }
+
         let semaphore = DispatchSemaphore(value: 0)
+        var feedError: Error?
 
         Task {
-            // Convert samples to AVAudioPCMBuffer
-            let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
-            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: UInt32(samples.count))!
-            buffer.frameLength = UInt32(samples.count)
-
-            let channelData = buffer.floatChannelData![0]
-            for (i, sample) in samples.enumerated() {
-                channelData[i] = sample
+            do {
+                try await manager.appendAudio(buffer)
+            } catch {
+                feedError = error
             }
-
-            await manager.streamAudio(buffer)
             semaphore.signal()
         }
 
         semaphore.wait()
+
+        if let error = feedError {
+            throw error
+        }
     }
 
     func streamingAsrFinish() throws -> String {
@@ -315,7 +326,7 @@ class FluidAudioBridgeInternal {
     }
 
     func transcribeFileStreaming(_ path: String) throws -> (String, Float, Double, Double, Float) {
-        guard let manager = streamingAsrManager, let models = asrModels else {
+        guard let manager = streamingAsrManager else {
             throw BridgeError.notInitialized
         }
 
@@ -328,11 +339,8 @@ class FluidAudioBridgeInternal {
         Task {
             do {
                 let url = URL(fileURLWithPath: path)
-
                 let startTime = Date()
-                try await manager.start(models: models, source: .microphone)
 
-                // Load and stream audio file
                 let audioFile = try AVAudioFile(forReading: url)
                 let format = audioFile.processingFormat
                 duration = Double(audioFile.length) / format.sampleRate
@@ -342,7 +350,7 @@ class FluidAudioBridgeInternal {
 
                 while audioFile.framePosition < audioFile.length {
                     try audioFile.read(into: buffer)
-                    await manager.streamAudio(buffer)
+                    try await manager.appendAudio(buffer)
                 }
 
                 text = try await manager.finish()
@@ -367,7 +375,62 @@ class FluidAudioBridgeInternal {
         return streamingAsrManager != nil
     }
 
-    // MARK: - Qwen3 ASR
+    // MARK: - Japanese ASR (Parakeet TDT-JA, macOS 14+)
+
+    func initializeJapaneseAsr() throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        var initError: Error?
+
+        Task {
+            do {
+                let models = try await AsrModels.downloadAndLoad(version: .tdtJa)
+                self.japaneseAsrManager = AsrManager(models: models)
+            } catch {
+                initError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = initError {
+            throw error
+        }
+    }
+
+    func japaneseTranscribeSamples(_ samples: [Float]) throws -> String {
+        guard let manager = japaneseAsrManager else {
+            throw BridgeError.notInitialized
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: ASRResult?
+        var transcribeError: Error?
+
+        Task {
+            do {
+                var state = TdtDecoderState.make(decoderLayers: 2)
+                result = try await manager.transcribe(samples, decoderState: &state)
+            } catch {
+                transcribeError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = transcribeError {
+            throw error
+        }
+
+        return result?.text ?? ""
+    }
+
+    func isJapaneseAsrAvailable() -> Bool {
+        return japaneseAsrManager != nil
+    }
+
+    // MARK: - Qwen3 ASR (macOS 15+)
 
     @available(macOS 15, iOS 18, *)
     func initializeQwen3Asr() throws {
@@ -376,10 +439,9 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
+                let _ = try await Qwen3AsrModels.downloadAndLoad()
                 let manager = Qwen3AsrManager()
-                // Models are auto-downloaded from HuggingFace on first use
-                let modelDir = try await Qwen3AsrModels.downloadModelIfNeeded()
-                try await manager.loadModels(from: modelDir)
+                try await manager.loadModels(from: Qwen3AsrModels.defaultCacheDirectory())
                 self.qwen3AsrManager = manager
             } catch {
                 initError = error
@@ -500,7 +562,7 @@ class FluidAudioBridgeInternal {
         return qwen3AsrManager != nil
     }
 
-    // MARK: - Qwen3 Streaming
+    // MARK: - Qwen3 Streaming (macOS 15+)
 
     @available(macOS 15, iOS 18, *)
     func initializeQwen3Streaming() throws {
@@ -509,9 +571,9 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
+                let _ = try await Qwen3AsrModels.downloadAndLoad()
                 let asrManager = Qwen3AsrManager()
-                let modelDir = try await Qwen3AsrModels.downloadModelIfNeeded()
-                try await asrManager.loadModels(from: modelDir)
+                try await asrManager.loadModels(from: Qwen3AsrModels.defaultCacheDirectory())
 
                 let streamingManager = Qwen3StreamingManager(asrManager: asrManager)
                 self.qwen3AsrManager = asrManager
@@ -620,8 +682,9 @@ class FluidAudioBridgeInternal {
         vadManager = nil
         diarizerManager = nil
         streamingAsrManager = nil
-        qwen3AsrManager = nil
-        qwen3StreamingManager = nil
+        _qwen3AsrManager = nil
+        _qwen3StreamingManager = nil
+        japaneseAsrManager = nil
     }
 }
 
@@ -683,7 +746,6 @@ public func fluidaudio_transcribe_file(
     do {
         let (text, confidence, duration, processingTime, rtfx) = try bridge.transcribeFile(pathString)
 
-        // Allocate and copy text
         if let outText = outText {
             let cString = strdup(text)
             outText.pointee = cString
@@ -720,7 +782,6 @@ public func fluidaudio_transcribe_samples(
     do {
         let (text, confidence, duration, processingTime, rtfx) = try bridge.transcribeSamples(samplesArray)
 
-        // Allocate and copy text
         if let outText = outText {
             let cString = strdup(text)
             outText.pointee = cString
@@ -895,9 +956,6 @@ public func fluidaudio_initialize_diarization(_ ptr: UnsafeMutableRawPointer?, _
     }
 }
 
-/// Diarize a file. Returns segment count via outCount.
-/// Each segment is 4 consecutive values: speakerId (char*), startTime (float), endTime (float), qualityScore (float).
-/// The flat arrays outSpeakerIds, outStartTimes, outEndTimes, outQualityScores must be freed by the caller.
 @_cdecl("fluidaudio_diarize_file")
 public func fluidaudio_diarize_file(
     _ ptr: UnsafeMutableRawPointer?,
@@ -1026,6 +1084,50 @@ public func fluidaudio_cleanup(_ ptr: UnsafeMutableRawPointer?) {
 @_cdecl("fluidaudio_free_string")
 public func fluidaudio_free_string(_ s: UnsafeMutablePointer<CChar>?) {
     free(s)
+}
+
+// MARK: - Japanese ASR FFI
+
+@_cdecl("fluidaudio_initialize_japanese_asr")
+public func fluidaudio_initialize_japanese_asr(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    do {
+        try bridge.initializeJapaneseAsr()
+        return 0
+    } catch {
+        print("Japanese ASR init error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_japanese_transcribe_samples")
+public func fluidaudio_japanese_transcribe_samples(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ samples: UnsafePointer<Float>?,
+    _ sampleCount: UInt32,
+    _ outText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr, let samples = samples else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    let samplesArray = Array(UnsafeBufferPointer(start: samples, count: Int(sampleCount)))
+    do {
+        let text = try bridge.japaneseTranscribeSamples(samplesArray)
+        if let outText = outText {
+            outText.pointee = strdup(text)
+        }
+        return 0
+    } catch {
+        print("Japanese transcribe samples error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_is_japanese_asr_available")
+public func fluidaudio_is_japanese_asr_available(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return 0 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    return bridge.isJapaneseAsrAvailable() ? 1 : 0
 }
 
 // MARK: - Qwen3 ASR FFI

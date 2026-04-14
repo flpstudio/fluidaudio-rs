@@ -131,6 +131,16 @@ extern "C" {
     ) -> i32;
     fn fluidaudio_is_qwen3_streaming_available(bridge: *mut std::ffi::c_void) -> i32;
 
+    // Japanese ASR (Parakeet TDT-JA via AsrModels, macOS 14+)
+    fn fluidaudio_initialize_japanese_asr(bridge: *mut std::ffi::c_void) -> i32;
+    fn fluidaudio_japanese_transcribe_samples(
+        bridge: *mut std::ffi::c_void,
+        samples: *const f32,
+        sample_count: u32,
+        out_text: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_is_japanese_asr_available(bridge: *mut std::ffi::c_void) -> i32;
+
     // Cleanup
     fn fluidaudio_cleanup(bridge: *mut std::ffi::c_void);
 
@@ -656,6 +666,48 @@ impl FluidAudioBridge {
 
     pub fn is_qwen3_streaming_available(&self) -> bool {
         unsafe { fluidaudio_is_qwen3_streaming_available(self.ptr) != 0 }
+    }
+
+    pub fn initialize_japanese_asr(&self) -> Result<(), String> {
+        let result = unsafe { fluidaudio_initialize_japanese_asr(self.ptr) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("Failed to initialize Japanese ASR".to_string())
+        }
+    }
+
+    pub fn japanese_transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
+        let mut text_ptr: *mut i8 = std::ptr::null_mut();
+
+        let result = unsafe {
+            fluidaudio_japanese_transcribe_samples(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as u32,
+                &mut text_ptr,
+            )
+        };
+
+        if result != 0 {
+            return Err("Japanese transcription failed".to_string());
+        }
+
+        let text = if text_ptr.is_null() {
+            String::new()
+        } else {
+            let text = unsafe { CStr::from_ptr(text_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { fluidaudio_free_string(text_ptr) };
+            text
+        };
+
+        Ok(text)
+    }
+
+    pub fn is_japanese_asr_available(&self) -> bool {
+        unsafe { fluidaudio_is_japanese_asr_available(self.ptr) != 0 }
     }
 
     pub fn system_info(&self) -> SystemInfo {

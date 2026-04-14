@@ -565,6 +565,33 @@ impl FluidAudio {
         self.bridge.is_qwen3_streaming_available()
     }
 
+    // ========== Japanese ASR Methods ==========
+
+    /// Initialize Japanese ASR (Parakeet TDT-JA) for Japanese speech recognition
+    ///
+    /// Uses AsrModels with version .tdtJa — the same AsrManager pipeline as English,
+    /// loaded with Japanese TDT model weights. Requires macOS 14+.
+    pub fn init_japanese_asr(&self) -> Result<(), FluidAudioError> {
+        self.bridge
+            .initialize_japanese_asr()
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Transcribe Japanese audio samples using Parakeet TDT-JA
+    ///
+    /// # Arguments
+    /// * `samples` - Slice of f32 audio samples (16kHz mono, normalized -1.0 to 1.0)
+    pub fn japanese_transcribe_samples(&self, samples: &[f32]) -> Result<String, FluidAudioError> {
+        self.bridge
+            .japanese_transcribe_samples(samples)
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Check if Japanese ASR is initialized and ready
+    pub fn is_japanese_asr_available(&self) -> bool {
+        self.bridge.is_japanese_asr_available()
+    }
+
     // ========== System Info ==========
 
     /// Get system information
