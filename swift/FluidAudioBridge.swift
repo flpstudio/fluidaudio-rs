@@ -235,7 +235,7 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
-                let manager = StreamingNemotronAsrManager()
+                let manager = StreamingNemotronAsrManager(requestedChunkSize: .ms160)
                 try await manager.loadModels()
                 self.streamingAsrManager = manager
             } catch {
